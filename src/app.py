@@ -198,13 +198,28 @@ def fetch_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
             "limite": PAGE_SIZE,
         }
         url = _build_url(path, params)
-        payload = fetch_json(url, token)
+
+        try:
+            payload = fetch_json(url, token)
+        except requests.exceptions.HTTPError as e:
+            status = None
+            if getattr(e, "response", None) is not None:
+                status = e.response.status_code
+
+            # En Caddis, algunos endpoints paginados devuelven 404
+            # cuando la página pedida ya no existe.
+            if status == 404:
+                logger.info("%s page %s returned 404 -> end of pagination", path, page)
+                break
+
+            raise
 
         body = payload.get("body", [])
         if not isinstance(body, list):
             body = []
 
         if not body:
+            logger.info("%s page %s returned empty body -> end of pagination", path, page)
             break
 
         all_rows.extend(body)
