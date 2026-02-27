@@ -595,10 +595,14 @@ def append_table(entity: str, temp_table: str) -> None:
 
     if entity == "stock_diario":
         sql_delete = f"""
-        DELETE FROM `{final_table}`
-        WHERE (fecha_snapshot, empresa, sku, deposito_id) IN (
-          SELECT fecha_snapshot, empresa, sku, deposito_id
-          FROM `{temp_table}`
+        DELETE FROM `{final_table}` T
+        WHERE EXISTS (
+        SELECT 1
+        FROM `{temp_table}` S
+        WHERE T.fecha_snapshot = S.fecha_snapshot
+            AND T.empresa = S.empresa
+            AND T.sku = S.sku
+            AND T.deposito_id = S.deposito_id
         )
         """
         run_query(sql_delete)
