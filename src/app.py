@@ -29,7 +29,7 @@ GCS_BUCKET = os.environ["GCS_BUCKET"]
 BQ_DATASET = os.environ["BQ_DATASET"]
 
 GCS_BASE_PREFIX = os.getenv("GCS_BASE_PREFIX", "caddis_batch")
-BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
+BQ_LOCATION = os.getenv("BQ_LOCATION", "us-central1")
 
 CADDIS_BASE_URL = os.getenv("CADDIS_BASE_URL", "https://www.caddis.com.ar/api/v1/").rstrip("/") + "/"
 CADDIS_LOGIN_URL = os.getenv("CADDIS_LOGIN_URL", "https://www.caddis.com.ar/api/v1/login")
@@ -819,7 +819,7 @@ def main() -> None:
     # -------------------------
     stock_api_rows = fetch_paginated_endpoint(token, "articulos/stock")
     stock_diario = build_stock_diario(
-        stock_api_rows=stock_api_rows,
+        stock_rows=stock_api_rows,
         snapshot_date=snapshot_date,
         articulos_index=articulos_index,
         depositos_index=depositos_index,
