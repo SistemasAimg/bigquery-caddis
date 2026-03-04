@@ -717,19 +717,53 @@ def append_table(entity: str, temp_table: str) -> None:
     ensure_final_table_from_temp(temp_table, final_table)
 
     if entity == "stock_diario":
+        # Primero elimina posibles duplicados del mismo snapshot
         sql_delete = f"""
         DELETE FROM `{final_table}` T
         WHERE EXISTS (
             SELECT 1
             FROM `{temp_table}` S
-            WHERE T.fecha_snapshot = S.fecha_snapshot
-              AND T.empresa = S.empresa
-              AND T.sku = S.sku
-              AND T.deposito_id = S.deposito_id
+            WHERE T.fecha_snapshot = CAST(S.fecha_snapshot AS STRING)
+              AND T.empresa = CAST(S.empresa AS STRING)
+              AND T.sku = CAST(S.sku AS STRING)
+              AND T.deposito_id = CAST(S.deposito_id AS STRING)
         )
         """
         run_query(sql_delete)
 
+        # Luego inserta con columnas explícitas y CASTs
+        # para evitar choques de tipo entre temp y final
+        sql_insert = f"""
+        INSERT INTO `{final_table}` (
+            fecha_snapshot,
+            empresa,
+            articulo_id,
+            sku,
+            deposito_id,
+            deposito_nombre,
+            stock,
+            transito,
+            _run_id,
+            _processed_at
+        )
+        SELECT
+            CAST(S.fecha_snapshot AS STRING) AS fecha_snapshot,
+            CAST(S.empresa AS STRING) AS empresa,
+            CAST(S.articulo_id AS STRING) AS articulo_id,
+            CAST(S.sku AS STRING) AS sku,
+            CAST(S.deposito_id AS STRING) AS deposito_id,
+            CAST(S.deposito_nombre AS STRING) AS deposito_nombre,
+            CAST(S.stock AS FLOAT64) AS stock,
+            CAST(S.transito AS FLOAT64) AS transito,
+            CAST(S._run_id AS STRING) AS _run_id,
+            CAST(S._processed_at AS STRING) AS _processed_at
+        FROM `{temp_table}` S
+        """
+        run_query(sql_insert)
+        logger.info("Appended entity %s into %s", entity, final_table)
+        return
+
+    # Comportamiento genérico para otras tablas si algún día usás append
     sql_insert = f"""
     INSERT INTO `{final_table}`
     SELECT * FROM `{temp_table}`
