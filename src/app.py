@@ -45,6 +45,10 @@ TZ_OFFSET = os.getenv("TZ_OFFSET", "-03:00")
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "5000"))
 
+# Endpoint opcional de depósitos / puntos de venta
+# Ejemplo: "depositos", "puntos-venta", "puntos_venta", etc.
+CADDIS_PDV_ENDPOINT = os.getenv("CADDIS_PDV_ENDPOINT", "").strip()
+
 RUN_ID = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
 TABLES = {
@@ -230,6 +234,17 @@ def fetch_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
     return all_rows
 
 
+def fetch_optional_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
+    if not path:
+        return []
+
+    try:
+        return fetch_paginated_endpoint(token, path)
+    except Exception as e:
+        logger.warning("Optional endpoint '%s' could not be fetched: %s", path, e)
+        return []
+
+
 # =========================
 # Helpers - Normalization
 # =========================
@@ -251,6 +266,83 @@ def _to_str(value: Any) -> Optional[str]:
 
 def _company_code() -> str:
     return COMPANY_CODE
+
+
+# =========================
+# Index builders / Dictionaries
+# =========================
+def build_articulos_index(articulos: List[Dict[str, Any]]) -> Dict[str, Dict[str, Optional[str]]]:
+    """
+    Diccionario maestro por SKU usando endpoint /articulos.
+    """
+    idx: Dict[str, Dict[str, Optional[str]]] = {}
+
+    for a in articulos:
+        sku = _to_str(a.get("sku"))
+        if not sku:
+            continue
+
+        idx[sku] = {
+            "articulo_id": _to_str(a.get("id")),
+            "nombre": _to_str(a.get("nombre")),
+            "marca": _to_str(a.get("marca")),
+            "tipo": _to_str(a.get("tipo")),
+            "grupo": _to_str(a.get("grupo")),
+            "nse": _to_str(a.get("nse")),
+            "ean": _to_str(a.get("ean")),
+            "estado": _to_str(a.get("estado")),
+        }
+
+    logger.info("Articulos index built: %s SKUs", len(idx))
+    return idx
+
+
+def build_depositos_index_from_endpoint(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Construye deposito_id -> deposito_nombre desde el endpoint específico
+    que me vas a pasar. Está hecho flexible para tolerar distintos formatos.
+    """
+    idx: Dict[str, str] = {}
+
+    for r in rows:
+        dep_id = (
+            _to_str(r.get("id"))
+            or _to_str(r.get("deposito_id"))
+            or _to_str(r.get("codigo"))
+            or _to_str(r.get("numero"))
+        )
+
+        dep_nombre = (
+            _to_str(r.get("nombre"))
+            or _to_str(r.get("deposito_nombre"))
+            or _to_str(r.get("descripcion"))
+            or _to_str(r.get("detalle"))
+        )
+
+        if dep_id and dep_nombre:
+            idx[dep_id] = dep_nombre
+
+    logger.info("Depositos index from endpoint built: %s rows", len(idx))
+    return idx
+
+
+def build_depositos_index_from_ventas(ventas: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Fallback: arma deposito_id -> deposito_nombre a partir de ventas.
+    No es ideal, pero sirve si no configuraste el endpoint de depósitos.
+    """
+    idx: Dict[str, str] = {}
+
+    for v in ventas:
+        deposito = v.get("deposito") or {}
+        dep_id = _to_str(deposito.get("id"))
+        dep_nombre = _to_str(deposito.get("nombre"))
+
+        if dep_id and dep_nombre:
+            idx[dep_id] = dep_nombre
+
+    logger.info("Depositos index from ventas built: %s rows", len(idx))
+    return idx
 
 
 # =========================
@@ -441,29 +533,60 @@ def build_dim_productos(articulos: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 # =========================
 # Entity builders from stock
 # =========================
-def build_stock_diario(stock_rows: List[Dict[str, Any]], snapshot_date: dt.date) -> List[Dict[str, Any]]:
+def build_stock_diario(
+    stock_rows: List[Dict[str, Any]],
+    snapshot_date: dt.date,
+    articulos_index: Dict[str, Dict[str, Optional[str]]],
+    depositos_index: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Enriquece /articulos/stock usando:
+    - articulos_index (por SKU) => para completar articulo_id
+    - depositos_index (por deposito_id) => para completar deposito_nombre
+    """
     rows: List[Dict[str, Any]] = []
     processed_at = dt.datetime.utcnow().isoformat() + "Z"
 
+    null_articulo_id_count = 0
+    null_deposito_nombre_count = 0
+
     for articulo in stock_rows:
-        articulo_id = _to_str(articulo.get("id"))
         sku = _to_str(articulo.get("sku"))
+        articulo_info = articulos_index.get(sku or "", {})
+
+        # El endpoint articulos/stock normalmente NO trae id
+        articulo_id = _to_str(articulo.get("id")) or articulo_info.get("articulo_id")
         depositos = articulo.get("depositos") or []
 
+        if articulo_id is None:
+            null_articulo_id_count += 1
+
         for dep in depositos:
+            deposito_id = _to_str(dep.get("id"))
+            deposito_nombre = _to_str(dep.get("nombre")) or depositos_index.get(deposito_id or "")
+
+            if deposito_nombre is None:
+                null_deposito_nombre_count += 1
+
             rows.append({
                 "fecha_snapshot": snapshot_date.isoformat(),
                 "empresa": _company_code(),
                 "articulo_id": articulo_id,
                 "sku": sku,
-                "deposito_id": _to_str(dep.get("id")),
-                "deposito_nombre": _to_str(dep.get("nombre")),
+                "deposito_id": deposito_id,
+                "deposito_nombre": deposito_nombre,
                 "stock": _safe_round(dep.get("stock"), 4),
                 "transito": _safe_round(dep.get("transito"), 4),
                 "_run_id": RUN_ID,
                 "_processed_at": processed_at,
             })
 
+    logger.info(
+        "Stock diario built: %s rows | filas con articulo_id nulo=%s | filas con deposito_nombre nulo=%s",
+        len(rows),
+        null_articulo_id_count,
+        null_deposito_nombre_count,
+    )
     return rows
 
 
@@ -597,12 +720,12 @@ def append_table(entity: str, temp_table: str) -> None:
         sql_delete = f"""
         DELETE FROM `{final_table}` T
         WHERE EXISTS (
-        SELECT 1
-        FROM `{temp_table}` S
-        WHERE T.fecha_snapshot = S.fecha_snapshot
-            AND T.empresa = S.empresa
-            AND T.sku = S.sku
-            AND T.deposito_id = S.deposito_id
+            SELECT 1
+            FROM `{temp_table}` S
+            WHERE T.fecha_snapshot = S.fecha_snapshot
+              AND T.empresa = S.empresa
+              AND T.sku = S.sku
+              AND T.deposito_id = S.deposito_id
         )
         """
         run_query(sql_delete)
@@ -657,6 +780,9 @@ def main() -> None:
     fecha_desde, fecha_hasta, snapshot_date = _resolve_date_range()
     token = get_access_token()
 
+    # -------------------------
+    # Ventas
+    # -------------------------
     ventas = fetch_ventas(token, fecha_desde, fecha_hasta)
 
     ventas_header = build_ventas_header(ventas)
@@ -665,12 +791,43 @@ def main() -> None:
     dim_puntos_venta = build_dim_puntos_venta(ventas)
     clientes = build_clientes(ventas)
 
+    # -------------------------
+    # Articulos (maestro por SKU)
+    # -------------------------
     articulos = fetch_paginated_endpoint(token, "articulos")
     dim_productos = build_dim_productos(articulos)
+    articulos_index = build_articulos_index(articulos)
 
+    # -------------------------
+    # Depositos / PDV (endpoint opcional)
+    # -------------------------
+    depositos_index: Dict[str, str] = {}
+
+    if CADDIS_PDV_ENDPOINT:
+        depositos_rows = fetch_optional_paginated_endpoint(token, CADDIS_PDV_ENDPOINT)
+        depositos_index = build_depositos_index_from_endpoint(depositos_rows)
+
+    # Fallback si no vino nada del endpoint de depósitos
+    if not depositos_index:
+        logger.warning(
+            "No depositos index from endpoint. Falling back to depositos inferred from ventas."
+        )
+        depositos_index = build_depositos_index_from_ventas(ventas)
+
+    # -------------------------
+    # Stock
+    # -------------------------
     stock_api_rows = fetch_paginated_endpoint(token, "articulos/stock")
-    stock_diario = build_stock_diario(stock_api_rows, snapshot_date)
+    stock_diario = build_stock_diario(
+        stock_api_rows=stock_api_rows,
+        snapshot_date=snapshot_date,
+        articulos_index=articulos_index,
+        depositos_index=depositos_index,
+    )
 
+    # -------------------------
+    # Persistencia
+    # -------------------------
     process_entity("ventas_header", ventas_header, snapshot_date, append=False)
     process_entity("ventas_items", ventas_items, snapshot_date, append=False)
     process_entity("dim_vendedores", dim_vendedores, snapshot_date, append=False)
