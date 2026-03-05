@@ -717,53 +717,53 @@ def append_table(entity: str, temp_table: str) -> None:
     ensure_final_table_from_temp(temp_table, final_table)
 
     if entity == "stock_diario":
-        # Primero elimina posibles duplicados del mismo snapshot
+        # 1) BORRAR lo existente del mismo snapshot + clave, pero casteando tipos
         sql_delete = f"""
         DELETE FROM `{final_table}` T
         WHERE EXISTS (
             SELECT 1
             FROM `{temp_table}` S
-            WHERE T.fecha_snapshot = CAST(S.fecha_snapshot AS STRING)
-              AND T.empresa = CAST(S.empresa AS STRING)
+            WHERE T.fecha_snapshot = DATE(S.fecha_snapshot)
+              AND T.empresa = SAFE_CAST(S.empresa AS INT64)
               AND T.sku = CAST(S.sku AS STRING)
-              AND T.deposito_id = CAST(S.deposito_id AS STRING)
+              AND T.deposito_id = SAFE_CAST(S.deposito_id AS INT64)
         )
         """
         run_query(sql_delete)
 
-        # Luego inserta con columnas explícitas y CASTs
-        # para evitar choques de tipo entre temp y final
+        # 2) INSERT con columnas explícitas + casts al tipo final
         sql_insert = f"""
         INSERT INTO `{final_table}` (
-            fecha_snapshot,
-            empresa,
-            articulo_id,
-            sku,
-            deposito_id,
-            deposito_nombre,
+            _run_id,
             stock,
             transito,
-            _run_id,
-            _processed_at
+            deposito_nombre,
+            _processed_at,
+            articulo_id,
+            deposito_id,
+            sku,
+            empresa,
+            fecha_snapshot
         )
         SELECT
-            CAST(S.fecha_snapshot AS STRING) AS fecha_snapshot,
-            CAST(S.empresa AS STRING) AS empresa,
-            CAST(S.articulo_id AS STRING) AS articulo_id,
-            CAST(S.sku AS STRING) AS sku,
-            CAST(S.deposito_id AS STRING) AS deposito_id,
-            CAST(S.deposito_nombre AS STRING) AS deposito_nombre,
-            CAST(S.stock AS FLOAT64) AS stock,
-            CAST(S.transito AS FLOAT64) AS transito,
             CAST(S._run_id AS STRING) AS _run_id,
-            CAST(S._processed_at AS STRING) AS _processed_at
+            SAFE_CAST(S.stock AS FLOAT64) AS stock,
+            SAFE_CAST(S.transito AS FLOAT64) AS transito,
+            CAST(S.deposito_nombre AS STRING) AS deposito_nombre,
+            SAFE_CAST(S._processed_at AS TIMESTAMP) AS _processed_at,
+            CAST(S.articulo_id AS STRING) AS articulo_id,
+            SAFE_CAST(S.deposito_id AS INT64) AS deposito_id,
+            CAST(S.sku AS STRING) AS sku,
+            SAFE_CAST(S.empresa AS INT64) AS empresa,
+            DATE(S.fecha_snapshot) AS fecha_snapshot
         FROM `{temp_table}` S
         """
         run_query(sql_insert)
-        logger.info("Appended entity %s into %s", entity, final_table)
+
+        logger.info("Appended entity %s into %s (with casts)", entity, final_table)
         return
 
-    # Comportamiento genérico para otras tablas si algún día usás append
+    # Fallback genérico para otros entities (si algún día lo usás)
     sql_insert = f"""
     INSERT INTO `{final_table}`
     SELECT * FROM `{temp_table}`
