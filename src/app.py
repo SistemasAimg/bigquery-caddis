@@ -29,6 +29,10 @@ GCS_BUCKET = os.environ["GCS_BUCKET"]
 BQ_DATASET = os.environ["BQ_DATASET"]
 
 GCS_BASE_PREFIX = os.getenv("GCS_BASE_PREFIX", "caddis_batch")
+
+# IMPORTANTE:
+# - BigQuery "location" debe ser un valor tipo "US" o "EU" o la región (ej: "us-central1")
+# - Tu caso real parece ser "us-central1" (por tus screenshots).
 BQ_LOCATION = os.getenv("BQ_LOCATION", "us-central1")
 
 CADDIS_BASE_URL = os.getenv("CADDIS_BASE_URL", "https://www.caddis.com.ar/api/v1/").rstrip("/") + "/"
@@ -44,10 +48,6 @@ TZ_OFFSET = os.getenv("TZ_OFFSET", "-03:00")
 
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "120"))
 PAGE_SIZE = int(os.getenv("PAGE_SIZE", "5000"))
-
-# Endpoint opcional de depósitos / puntos de venta
-# Ejemplo: "depositos", "puntos-venta", "puntos_venta", etc.
-CADDIS_PDV_ENDPOINT = os.getenv("CADDIS_PDV_ENDPOINT", "").strip()
 
 RUN_ID = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
@@ -104,10 +104,7 @@ def _resolve_date_range() -> Tuple[str, str, dt.date]:
 # =========================
 def get_access_token() -> str:
     logger.info("Getting fresh Caddis token...")
-    payload = {
-        "usuario": CADDIS_USER,
-        "password": CADDIS_PASSWORD,
-    }
+    payload = {"usuario": CADDIS_USER, "password": CADDIS_PASSWORD}
     response = requests.post(CADDIS_LOGIN_URL, json=payload, timeout=API_TIMEOUT)
     response.raise_for_status()
 
@@ -197,10 +194,7 @@ def fetch_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
     all_rows: List[Dict[str, Any]] = []
 
     while True:
-        params = {
-            "pagina": page,
-            "limite": PAGE_SIZE,
-        }
+        params = {"pagina": page, "limite": PAGE_SIZE}
         url = _build_url(path, params)
 
         try:
@@ -210,8 +204,7 @@ def fetch_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
             if getattr(e, "response", None) is not None:
                 status = e.response.status_code
 
-            # En Caddis, algunos endpoints paginados devuelven 404
-            # cuando la página pedida ya no existe.
+            # Algunos endpoints paginados devuelven 404 cuando ya no existe la página
             if status == 404:
                 logger.info("%s page %s returned 404 -> end of pagination", path, page)
                 break
@@ -232,17 +225,6 @@ def fetch_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
 
     logger.info("Total rows fetched for %s: %s", path, len(all_rows))
     return all_rows
-
-
-def fetch_optional_paginated_endpoint(token: str, path: str) -> List[Dict[str, Any]]:
-    if not path:
-        return []
-
-    try:
-        return fetch_paginated_endpoint(token, path)
-    except Exception as e:
-        logger.warning("Optional endpoint '%s' could not be fetched: %s", path, e)
-        return []
 
 
 # =========================
@@ -274,6 +256,7 @@ def _company_code() -> str:
 def build_articulos_index(articulos: List[Dict[str, Any]]) -> Dict[str, Dict[str, Optional[str]]]:
     """
     Diccionario maestro por SKU usando endpoint /articulos.
+    Se usa para completar articulo_id cuando /articulos/stock no lo trae.
     """
     idx: Dict[str, Dict[str, Optional[str]]] = {}
 
@@ -297,51 +280,25 @@ def build_articulos_index(articulos: List[Dict[str, Any]]) -> Dict[str, Dict[str
     return idx
 
 
-def build_depositos_index_from_endpoint(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+def load_depositos_index_from_bq(company_code: str) -> Dict[str, str]:
     """
-    Construye deposito_id -> deposito_nombre desde el endpoint específico
-    que me vas a pasar. Está hecho flexible para tolerar distintos formatos.
+    Lee el diccionario limpio desde BigQuery:
+      `caddis_raw.vw_dic_depositos_activos`
+    Esta view debe filtrar por allowlist y dejar 1 nombre por deposito_id.
     """
-    idx: Dict[str, str] = {}
-
-    for r in rows:
-        dep_id = (
-            _to_str(r.get("id"))
-            or _to_str(r.get("deposito_id"))
-            or _to_str(r.get("codigo"))
-            or _to_str(r.get("numero"))
-        )
-
-        dep_nombre = (
-            _to_str(r.get("nombre"))
-            or _to_str(r.get("deposito_nombre"))
-            or _to_str(r.get("descripcion"))
-            or _to_str(r.get("detalle"))
-        )
-
-        if dep_id and dep_nombre:
-            idx[dep_id] = dep_nombre
-
-    logger.info("Depositos index from endpoint built: %s rows", len(idx))
-    return idx
-
-
-def build_depositos_index_from_ventas(ventas: List[Dict[str, Any]]) -> Dict[str, str]:
+    sql = f"""
+    SELECT
+      CAST(deposito_id AS STRING) AS deposito_id,
+      deposito_nombre
+    FROM `{GCP_PROJECT}.caddis_raw.vw_dic_depositos_activos`
+    WHERE empresa = SAFE_CAST(@empresa AS INT64)
     """
-    Fallback: arma deposito_id -> deposito_nombre a partir de ventas.
-    No es ideal, pero sirve si no configuraste el endpoint de depósitos.
-    """
-    idx: Dict[str, str] = {}
-
-    for v in ventas:
-        deposito = v.get("deposito") or {}
-        dep_id = _to_str(deposito.get("id"))
-        dep_nombre = _to_str(deposito.get("nombre"))
-
-        if dep_id and dep_nombre:
-            idx[dep_id] = dep_nombre
-
-    logger.info("Depositos index from ventas built: %s rows", len(idx))
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("empresa", "STRING", company_code)]
+    )
+    rows = bq_client.query(sql, job_config=job_config).result()
+    idx = {row["deposito_id"]: row["deposito_nombre"] for row in rows}
+    logger.info("Depositos index loaded from BQ allowlist: %s", len(idx))
     return idx
 
 
@@ -541,32 +498,37 @@ def build_stock_diario(
 ) -> List[Dict[str, Any]]:
     """
     Enriquece /articulos/stock usando:
-    - articulos_index (por SKU) => para completar articulo_id
-    - depositos_index (por deposito_id) => para completar deposito_nombre
+    - articulos_index (por SKU) => completa articulo_id
+    - depositos_index (por deposito_id) => completa deposito_nombre
+    - FILTRA: si el deposito_id NO está en depositos_index => NO se inserta (allowlist)
     """
     rows: List[Dict[str, Any]] = []
     processed_at = dt.datetime.utcnow().isoformat() + "Z"
 
     null_articulo_id_count = 0
-    null_deposito_nombre_count = 0
+    filtered_out_depositos = 0
 
     for articulo in stock_rows:
         sku = _to_str(articulo.get("sku"))
-        articulo_info = articulos_index.get(sku or "", {})
+        if not sku:
+            continue
 
-        # El endpoint articulos/stock normalmente NO trae id
+        articulo_info = articulos_index.get(sku, {})
+        # /articulos/stock normalmente NO trae id
         articulo_id = _to_str(articulo.get("id")) or articulo_info.get("articulo_id")
-        depositos = articulo.get("depositos") or []
 
         if articulo_id is None:
             null_articulo_id_count += 1
 
+        depositos = articulo.get("depositos") or []
         for dep in depositos:
             deposito_id = _to_str(dep.get("id"))
-            deposito_nombre = _to_str(dep.get("nombre")) or depositos_index.get(deposito_id or "")
+            deposito_nombre = depositos_index.get(deposito_id or "")
 
-            if deposito_nombre is None:
-                null_deposito_nombre_count += 1
+            # FILTRO allowlist: si no está en el diccionario, se descarta
+            if not deposito_nombre:
+                filtered_out_depositos += 1
+                continue
 
             rows.append({
                 "fecha_snapshot": snapshot_date.isoformat(),
@@ -582,10 +544,10 @@ def build_stock_diario(
             })
 
     logger.info(
-        "Stock diario built: %s rows | filas con articulo_id nulo=%s | filas con deposito_nombre nulo=%s",
+        "Stock diario built: %s rows | articulo_id nulo=%s | depositos filtrados=%s",
         len(rows),
         null_articulo_id_count,
-        null_deposito_nombre_count,
+        filtered_out_depositos,
     )
     return rows
 
@@ -717,7 +679,7 @@ def append_table(entity: str, temp_table: str) -> None:
     ensure_final_table_from_temp(temp_table, final_table)
 
     if entity == "stock_diario":
-        # 1) BORRAR lo existente del mismo snapshot + clave, pero casteando tipos
+        # 1) DELETE existente del mismo snapshot + clave, casteando tipos
         sql_delete = f"""
         DELETE FROM `{final_table}` T
         WHERE EXISTS (
@@ -763,7 +725,7 @@ def append_table(entity: str, temp_table: str) -> None:
         logger.info("Appended entity %s into %s (with casts)", entity, final_table)
         return
 
-    # Fallback genérico para otros entities (si algún día lo usás)
+    # Fallback genérico
     sql_insert = f"""
     INSERT INTO `{final_table}`
     SELECT * FROM `{temp_table}`
@@ -833,20 +795,14 @@ def main() -> None:
     articulos_index = build_articulos_index(articulos)
 
     # -------------------------
-    # Depositos / PDV (endpoint opcional)
+    # Depositos / PDV: diccionario DESDE BIGQUERY (allowlist)
     # -------------------------
-    depositos_index: Dict[str, str] = {}
-
-    if CADDIS_PDV_ENDPOINT:
-        depositos_rows = fetch_optional_paginated_endpoint(token, CADDIS_PDV_ENDPOINT)
-        depositos_index = build_depositos_index_from_endpoint(depositos_rows)
-
-    # Fallback si no vino nada del endpoint de depósitos
+    depositos_index = load_depositos_index_from_bq(COMPANY_CODE)
     if not depositos_index:
-        logger.warning(
-            "No depositos index from endpoint. Falling back to depositos inferred from ventas."
+        raise RuntimeError(
+            "Depositos index is empty. Verificá que exista la view "
+            "`caddis_raw.vw_dic_depositos_activos` y que tu allowlist tenga filas."
         )
-        depositos_index = build_depositos_index_from_ventas(ventas)
 
     # -------------------------
     # Stock
